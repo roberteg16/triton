@@ -29,6 +29,7 @@ add_triton_library(TritonAMDGPUToLLVM
     Fp4ToFpOpToLLVM.cpp
     MembarUtility.cpp
     ScalarizePackedFOps.cpp
+    PreRALLIRSchedule.cpp
     TDMUtility.cpp
     BarrierOpToLLVM.cpp
     WarpIdOpToLLVM.cpp
