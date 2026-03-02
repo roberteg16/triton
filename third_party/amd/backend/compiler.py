@@ -260,7 +260,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
         amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong, use_lds_prefetch)
         if use_lds_prefetch:
-            passes.ttgpuir.add_prefetch(pm)
+            amd.passes.ttgpuir.add_lds_prefetch(pm)
 
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)

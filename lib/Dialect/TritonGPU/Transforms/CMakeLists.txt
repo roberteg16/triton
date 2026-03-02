@@ -43,8 +43,6 @@ add_triton_library(TritonGPUTransforms
   LINK_LIBS PUBLIC
   MLIRTransforms
   MLIRTransformUtils
-  MLIRLLVMDialect
-  MLIRGPUToROCDLTransforms
   TritonAnalysis
   TritonIR
   TritonTransforms

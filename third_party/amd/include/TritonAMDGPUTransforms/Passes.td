@@ -348,4 +348,29 @@ def TritonAMDGPUWarpPipeline: Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp
   let dependentDialects = ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPULdsPrefetch : Pass<"tritonamdgpu-lds-prefetch", "mlir::ModuleOp"> {
+  let summary = "lds prefetch";
+
+  let description = [{
+    This pass attempts to prefetch from shared memory the operands (A and B)
+    of a `tt.dot`, when this operation is located in a loop.
+    Decompose `DotOp` instructions in loops into several finer-grained `DotOp`
+    that may have their operands constructed at the end of the previous
+    iteration.
+    Transformations are performed in five different places:
+      1. The pass emits a prologue to the loop where the data for the first
+         loop iteration are prefetched.
+      2. The loop arguments are extended with the new prefetched values.
+      3. The dotOp parameters is updated with the new args.
+      4. The prefetch operations for the next iteration are added to the loop.
+      5. The yieldOp is updated by adding the prefetched values for the next
+         iteration.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
+}
+
 #endif
