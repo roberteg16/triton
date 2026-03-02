@@ -74,10 +74,10 @@ namespace {
 
 // Helper function to split a value (Dot C operand) along a specific axis into
 // numSlices. Performs Reshape + Transpose + Split + ConvertLayout.
-static SmallVector<Value> splitValueAlongAxis(Value input, int32_t numSlices,
-                                              int axis, SmallVector<RankedTensorType>& typesBeforeSplitting,
-                                              Location loc,
-                                              OpBuilder &builder) {
+static SmallVector<Value>
+splitValueAlongAxis(Value input, int32_t numSlices, int axis,
+                    SmallVector<RankedTensorType> &typesBeforeSplitting,
+                    Location loc, OpBuilder &builder) {
   if (numSlices == 1) {
     return {input};
   }
@@ -140,8 +140,10 @@ static SmallVector<Value> splitValueAlongAxis(Value input, int32_t numSlices,
 // Helper function (inverse of splitValueAlongAxis) to join Values (D opd of
 // Dot) along a specific axis. Performs Join + Transpose + Reshape +
 // ConvertLayout.
-static Value joinValuesAlongAxis(SmallVector<Value> tiles, int axis, SmallVector<RankedTensorType>& typesBeforeSplitting,
-                                 Location loc, OpBuilder &builder) {
+static Value
+joinValuesAlongAxis(SmallVector<Value> tiles, int axis,
+                    SmallVector<RankedTensorType> &typesBeforeSplitting,
+                    Location loc, OpBuilder &builder) {
 
   auto joinOnce = [&](Value left, Value right,
                       RankedTensorType dstType) -> Value {
@@ -227,7 +229,7 @@ createDotOp(Operation *dotOp, OpBuilder &builder, Location loc,
 }
 
 class Prefetcher {
-  public:
+public:
   Prefetcher() = delete;
   ~Prefetcher() = default;
 
@@ -241,23 +243,21 @@ class Prefetcher {
 
   scf::ForOp createNewForOp();
 
-  private:
-
+private:
   /// Compute prefetch widths from dot encoding and shapes.
   /// Returns true if widths were set and this dot should be prefetched;
   /// false to skip this dot (e.g. kSize too small or dot not recognized).
   bool computePrefetchWidthForDotType(Attribute dotEncoding,
-    unsigned aTypeBitWidth,
-    ArrayRef<int64_t> dShape, unsigned mSize,
-    unsigned nSize, unsigned kSize,
-    unsigned kWidth, bool transA,
-    bool transB);
+                                      unsigned aTypeBitWidth,
+                                      ArrayRef<int64_t> dShape, unsigned mSize,
+                                      unsigned nSize, unsigned kSize,
+                                      unsigned kWidth, bool transA,
+                                      bool transB);
 
   std::tuple<unsigned, unsigned, unsigned>
-  computePrefetchWidth(unsigned mSize, unsigned nSize, unsigned kSize, bool transA,
-                                                   bool transB, ArrayRef<unsigned> instrShape,
-                                                   ArrayRef<unsigned> warpsPerCta, unsigned numInsts);
-
+  computePrefetchWidth(unsigned mSize, unsigned nSize, unsigned kSize,
+                       bool transA, bool transB, ArrayRef<unsigned> instrShape,
+                       ArrayRef<unsigned> warpsPerCta, unsigned numInsts);
 
   FailureOr<Value> getAsyncWaitTokenForLocalLoad(Operation *cvt,
                                                  bool fromPriorIter,
@@ -265,14 +265,14 @@ class Prefetcher {
                                                  IRMapping *mapping = nullptr);
 
   Value generateLocalLoad(Value v, unsigned opIdx, bool isPrologue,
-                         Attribute dotEncoding, OpBuilder &builder,
-                         std::optional<Value> asyncWaitToken = std::nullopt,
-                         std::optional<int64_t> offsetM = std::nullopt,
-                         std::optional<int64_t> shapeM = std::nullopt,
-                         std::optional<int64_t> offsetN = std::nullopt,
-                         std::optional<int64_t> shapeN = std::nullopt,
-                         std::optional<int64_t> offsetK = std::nullopt,
-                         std::optional<int64_t> shapeK = std::nullopt);
+                          Attribute dotEncoding, OpBuilder &builder,
+                          std::optional<Value> asyncWaitToken = std::nullopt,
+                          std::optional<int64_t> offsetM = std::nullopt,
+                          std::optional<int64_t> shapeM = std::nullopt,
+                          std::optional<int64_t> offsetN = std::nullopt,
+                          std::optional<int64_t> shapeN = std::nullopt,
+                          std::optional<int64_t> offsetK = std::nullopt,
+                          std::optional<int64_t> shapeK = std::nullopt);
 
   void cloneElementwiseOps(Value &bRem, const SmallVector<Value> &vals,
                            OpBuilder &builder);
@@ -314,7 +314,6 @@ class Prefetcher {
   unsigned kWidth;
 };
 
-
 LogicalResult Prefetcher::initialize() {
   Block *loop = forOp.getBody();
 
@@ -327,8 +326,10 @@ LogicalResult Prefetcher::initialize() {
     if (auto dotInterface = dyn_cast<triton::DotOpInterface>(&op)) {
       // Only accepts dot ops encoded as Nvidia MMA v2 or AMD MFMA/WMMA
       Value result = dotInterface.getD();
-      auto dstMfmaEnc = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(getEncoding(result));
-      auto dstWmmaEnc = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(getEncoding(result));
+      auto dstMfmaEnc =
+          dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(getEncoding(result));
+      auto dstWmmaEnc =
+          dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(getEncoding(result));
       if (!dstMfmaEnc && !dstWmmaEnc)
         // Don't rewrite if any other type is found.
         return failure();
@@ -358,7 +359,8 @@ LogicalResult Prefetcher::initialize() {
       if (auto cvt = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
         // NYI for other encodings, for example if we have transpose
         // in the chain
-        if (isa<triton::gpu::DotOperandEncodingAttr>(cvt.getType().getEncoding()))
+        if (isa<triton::gpu::DotOperandEncodingAttr>(
+                cvt.getType().getEncoding()))
           foundConvertFromShared = true;
         break;
       }
@@ -419,9 +421,9 @@ LogicalResult Prefetcher::initialize() {
     bool transB = transOp(bOpd.getDefiningOp(), 1);
     Attribute dotEncoding =
         cast<RankedTensorType>(dot->getResult(0).getType()).getEncoding();
-    if (!computePrefetchWidthForDotType(dotEncoding, aType.getElementTypeBitWidth(),
-                               dType.getShape(), mSize, nSize, kSize, kWidth,
-                               transA, transB))
+    if (!computePrefetchWidthForDotType(
+            dotEncoding, aType.getElementTypeBitWidth(), dType.getShape(),
+            mSize, nSize, kSize, kWidth, transA, transB))
       continue;
     LDBG("prefetchWidthMNK: " << prefetchWidthM << "x" << prefetchWidthN << "x"
                               << prefetchWidthK);
@@ -580,156 +582,159 @@ scf::ForOp Prefetcher::createNewForOp() {
     (b) How local_loads are distributed during the series of mfmas.
     (c) More research can be done here.
 */
-bool Prefetcher::computePrefetchWidthForDotType(Attribute dotEncoding, unsigned aTypeBitWidth,
-  ArrayRef<int64_t> dShape, unsigned mSize,
-  unsigned nSize, unsigned kSize, unsigned kWidth,
-  bool transA, bool transB) {
+bool Prefetcher::computePrefetchWidthForDotType(Attribute dotEncoding,
+                                                unsigned aTypeBitWidth,
+                                                ArrayRef<int64_t> dShape,
+                                                unsigned mSize, unsigned nSize,
+                                                unsigned kSize, unsigned kWidth,
+                                                bool transA, bool transB) {
   if (auto mfmaEnc = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dotEncoding)) {
     unsigned numInsts = 4;
-    std::tie(prefetchWidthM, prefetchWidthN, prefetchWidthK) = computePrefetchWidth(
-    mSize, nSize, kSize, transA, transB, mfmaEnc.getInstrShape(),
-    mfmaEnc.getWarpsPerCTA(), numInsts);
+    std::tie(prefetchWidthM, prefetchWidthN, prefetchWidthK) =
+        computePrefetchWidth(mSize, nSize, kSize, transA, transB,
+                             mfmaEnc.getInstrShape(), mfmaEnc.getWarpsPerCTA(),
+                             numInsts);
     return true;
   }
   if (auto wmmaEnc = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(dotEncoding)) {
     unsigned numInsts = 8;
     auto warpsPerCTA = triton::gpu::getWarpsPerCTA(wmmaEnc, dShape);
     std::tie(prefetchWidthM, prefetchWidthN, prefetchWidthK) =
-    computePrefetchWidth(mSize, nSize, kSize, transA, transB,
-    wmmaEnc.getInstrShape(), warpsPerCTA, numInsts);
+        computePrefetchWidth(mSize, nSize, kSize, transA, transB,
+                             wmmaEnc.getInstrShape(), warpsPerCTA, numInsts);
     return true;
   }
   return false;
 }
 
-std::tuple<unsigned, unsigned, unsigned>
-Prefetcher::computePrefetchWidth(unsigned mSize, unsigned nSize, unsigned kSize, bool transA,
-                bool transB, ArrayRef<unsigned> instrShape,
-                ArrayRef<unsigned> warpsPerCta, unsigned numInsts) {
+std::tuple<unsigned, unsigned, unsigned> Prefetcher::computePrefetchWidth(
+    unsigned mSize, unsigned nSize, unsigned kSize, bool transA, bool transB,
+    ArrayRef<unsigned> instrShape, ArrayRef<unsigned> warpsPerCta,
+    unsigned numInsts) {
 
-    // minimum transpose width
-    ModuleOp module = this->forOp.getOperation()->getParentOfType<ModuleOp>();
-    std::optional<StringRef> arch = getAMDArch(module);
-    std::string archStr = arch->str();
-    unsigned mtw = 32;
-    if (archStr == "gfx1250") {
-      mtw = 128;
-    } else if (archStr == "gfx942" || archStr == "gfx950" ||
-               archStr == "gfx951") {
-      mtw = 64;
-    }
+  // minimum transpose width
+  ModuleOp module = this->forOp.getOperation()->getParentOfType<ModuleOp>();
+  std::optional<StringRef> arch = getAMDArch(module);
+  std::string archStr = arch->str();
+  unsigned mtw = 32;
+  if (archStr == "gfx1250") {
+    mtw = 128;
+  } else if (archStr == "gfx942" || archStr == "gfx950" ||
+             archStr == "gfx951") {
+    mtw = 64;
+  }
 
-    LDBG("instrShape: " << instrShape[0] << "x" << instrShape[1] << "x"
-                        << instrShape[2]);
-    LDBG("warpsPerCta: " << warpsPerCta[0] << "x" << warpsPerCta[1]);
-    LDBG("TotalInsts: " << mSize / (instrShape[0] * warpsPerCta[0]) << "x"
-                        << nSize / (instrShape[1] * warpsPerCta[1]) << "x"
-                        << kSize / instrShape[2] << " (" << numInsts << ")");
-    // mnk specify num ops a sliced dot
-    unsigned m = 1, n = 1, k = 1;
-    unsigned maxM = mSize / (instrShape[0] * warpsPerCta[0]);
-    unsigned maxN = nSize / (instrShape[1] * warpsPerCta[1]);
-    unsigned maxK = kSize / (instrShape[2]);
-    if (transA) {
-      m = std::max<unsigned>(m, mtw / instrShape[0]);
-      k = std::max<unsigned>(k, mtw / instrShape[2]);
-    }
-    if (transB) {
-      n = std::max<unsigned>(n, mtw / instrShape[1]);
-      k = std::max<unsigned>(k, mtw / instrShape[2]);
-    }
-    numInsts /= (m * n * k);
-    LDBG("instr tile m: " << m << ", n: " << n << ", k: " << k);
-    // Iteratively increase the tile shape until we reach numInsts
-    // according to the preferred shape.
-    // Currently, LLVM scheduling seems to schedule rows better than squares.
-    bool preferSquare = false;
-    while (numInsts > 1) {
+  LDBG("instrShape: " << instrShape[0] << "x" << instrShape[1] << "x"
+                      << instrShape[2]);
+  LDBG("warpsPerCta: " << warpsPerCta[0] << "x" << warpsPerCta[1]);
+  LDBG("TotalInsts: " << mSize / (instrShape[0] * warpsPerCta[0]) << "x"
+                      << nSize / (instrShape[1] * warpsPerCta[1]) << "x"
+                      << kSize / instrShape[2] << " (" << numInsts << ")");
+  // mnk specify num ops a sliced dot
+  unsigned m = 1, n = 1, k = 1;
+  unsigned maxM = mSize / (instrShape[0] * warpsPerCta[0]);
+  unsigned maxN = nSize / (instrShape[1] * warpsPerCta[1]);
+  unsigned maxK = kSize / (instrShape[2]);
+  if (transA) {
+    m = std::max<unsigned>(m, mtw / instrShape[0]);
+    k = std::max<unsigned>(k, mtw / instrShape[2]);
+  }
+  if (transB) {
+    n = std::max<unsigned>(n, mtw / instrShape[1]);
+    k = std::max<unsigned>(k, mtw / instrShape[2]);
+  }
+  numInsts /= (m * n * k);
+  LDBG("instr tile m: " << m << ", n: " << n << ", k: " << k);
+  // Iteratively increase the tile shape until we reach numInsts
+  // according to the preferred shape.
+  // Currently, LLVM scheduling seems to schedule rows better than squares.
+  bool preferSquare = false;
+  while (numInsts > 1) {
 
-      if ((m <= n || !preferSquare) && m < maxM && !transA) {
-        m *= 2;
-      } else if (n < maxN) {
-        n *= 2;
-      } else if (k < maxK) {
-        k *= 2;
-      } else {
-        break;
-      }
-      numInsts /= 2;
+    if ((m <= n || !preferSquare) && m < maxM && !transA) {
+      m *= 2;
+    } else if (n < maxN) {
+      n *= 2;
+    } else if (k < maxK) {
+      k *= 2;
+    } else {
+      break;
     }
-    LDBG("instr tile m: " << m << ", n: " << n << ", k: " << k);
-    // convert num ops to CTA tile shape
-    m *= instrShape[0] * warpsPerCta[0];
-    n *= instrShape[1] * warpsPerCta[1];
-    k *= instrShape[2];
-    m = std::min<unsigned>(m, mSize);
-    n = std::min<unsigned>(n, nSize);
-    k = std::min<unsigned>(k, kSize);
-    return {m, n, k};
+    numInsts /= 2;
+  }
+  LDBG("instr tile m: " << m << ", n: " << n << ", k: " << k);
+  // convert num ops to CTA tile shape
+  m *= instrShape[0] * warpsPerCta[0];
+  n *= instrShape[1] * warpsPerCta[1];
+  k *= instrShape[2];
+  m = std::min<unsigned>(m, mSize);
+  n = std::min<unsigned>(n, nSize);
+  k = std::min<unsigned>(k, kSize);
+  return {m, n, k};
 }
 
 // Since dots have 3D slicing, the MemDescSubslice for loca loads
 // will have 2D offsets and shapes.
 Value Prefetcher::generateLocalLoad(
-  Value v, unsigned opIdx, bool isPrologue, Attribute dotEncoding,
-  OpBuilder &builder, std::optional<Value> asyncWaitToken,
-  std::optional<int64_t> offsetM, std::optional<int64_t> shapeM,
-  std::optional<int64_t> offsetN, std::optional<int64_t> shapeN,
-  std::optional<int64_t> offsetK, std::optional<int64_t> shapeK) {
-// opIdx: 0 => a, 1 => b
-auto type = cast<triton::gpu::MemDescType>(v.getType());
-SmallVector<int64_t> shape{type.getShape().begin(), type.getShape().end()};
-auto rank = shape.size();
-SmallVector<int32_t> offset(rank, 0);
-Type elementType = type.getElementType();
+    Value v, unsigned opIdx, bool isPrologue, Attribute dotEncoding,
+    OpBuilder &builder, std::optional<Value> asyncWaitToken,
+    std::optional<int64_t> offsetM, std::optional<int64_t> shapeM,
+    std::optional<int64_t> offsetN, std::optional<int64_t> shapeN,
+    std::optional<int64_t> offsetK, std::optional<int64_t> shapeK) {
+  // opIdx: 0 => a, 1 => b
+  auto type = cast<triton::gpu::MemDescType>(v.getType());
+  SmallVector<int64_t> shape{type.getShape().begin(), type.getShape().end()};
+  auto rank = shape.size();
+  SmallVector<int32_t> offset(rank, 0);
+  Type elementType = type.getElementType();
 
-// For operand A (opIdx=0): shape is [M, K], so mIdx=0, kIdx=1
-// For operand B (opIdx=1): shape is [K, N], so kIdx=0, nIdx=1
-int64_t mIdx = 0; // M dimension index (only for operand A)
-int64_t nIdx = 1; // N dimension index (only for operand B)
-int64_t kIdx = opIdx == 0 ? rank - 1 : rank - 2;
+  // For operand A (opIdx=0): shape is [M, K], so mIdx=0, kIdx=1
+  // For operand B (opIdx=1): shape is [K, N], so kIdx=0, nIdx=1
+  int64_t mIdx = 0; // M dimension index (only for operand A)
+  int64_t nIdx = 1; // N dimension index (only for operand B)
+  int64_t kIdx = opIdx == 0 ? rank - 1 : rank - 2;
 
-// Handle m dim for opd A
-if (opIdx == 0) {
-  offset[mIdx] = isPrologue ? 0 : prefetchWidthM;
-  shape[mIdx] = isPrologue ? prefetchWidthM : (shape[mIdx] - prefetchWidthM);
-  if (shapeM)
-    shape[mIdx] = *shapeM;
-  if (offsetM)
-    offset[mIdx] = *offsetM;
-}
+  // Handle m dim for opd A
+  if (opIdx == 0) {
+    offset[mIdx] = isPrologue ? 0 : prefetchWidthM;
+    shape[mIdx] = isPrologue ? prefetchWidthM : (shape[mIdx] - prefetchWidthM);
+    if (shapeM)
+      shape[mIdx] = *shapeM;
+    if (offsetM)
+      offset[mIdx] = *offsetM;
+  }
 
-// Handle n dim for opd B
-if (opIdx == 1) {
-  offset[nIdx] = isPrologue ? 0 : prefetchWidthN;
-  shape[nIdx] = isPrologue ? prefetchWidthN : (shape[nIdx] - prefetchWidthN);
-  if (shapeN)
-    shape[nIdx] = *shapeN;
-  if (offsetN)
-    offset[nIdx] = *offsetN;
-}
+  // Handle n dim for opd B
+  if (opIdx == 1) {
+    offset[nIdx] = isPrologue ? 0 : prefetchWidthN;
+    shape[nIdx] = isPrologue ? prefetchWidthN : (shape[nIdx] - prefetchWidthN);
+    if (shapeN)
+      shape[nIdx] = *shapeN;
+    if (offsetN)
+      offset[nIdx] = *offsetN;
+  }
 
-// Handle k dim
-offset[kIdx] = isPrologue ? 0 : prefetchWidthK;
-shape[kIdx] = isPrologue ? prefetchWidthK : (shape[kIdx] - prefetchWidthK);
-if (shapeK)
-  shape[kIdx] = *shapeK;
-if (offsetK)
-  offset[kIdx] = *offsetK;
+  // Handle k dim
+  offset[kIdx] = isPrologue ? 0 : prefetchWidthK;
+  shape[kIdx] = isPrologue ? prefetchWidthK : (shape[kIdx] - prefetchWidthK);
+  if (shapeK)
+    shape[kIdx] = *shapeK;
+  if (offsetK)
+    offset[kIdx] = *offsetK;
 
-Value newSmem = triton::gpu::MemDescSubsliceOp::create(
-    builder, v.getLoc(),
-    triton::gpu::MemDescType::get(
-        shape, elementType, type.getEncoding(), type.getMemorySpace(),
-        type.getMutableMemory(), type.getAllocShape()),
-    v, offset);
-auto dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(
-    builder.getContext(), opIdx, dotEncoding, kWidth);
-Value prefetchSlice = triton::gpu::LocalLoadOp::create(
-    builder, v.getLoc(),
-    RankedTensorType::get(shape, elementType, dotOperandEnc), newSmem,
-    asyncWaitToken.value_or(nullptr));
-return prefetchSlice;
+  Value newSmem = triton::gpu::MemDescSubsliceOp::create(
+      builder, v.getLoc(),
+      triton::gpu::MemDescType::get(
+          shape, elementType, type.getEncoding(), type.getMemorySpace(),
+          type.getMutableMemory(), type.getAllocShape()),
+      v, offset);
+  auto dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(
+      builder.getContext(), opIdx, dotEncoding, kWidth);
+  Value prefetchSlice = triton::gpu::LocalLoadOp::create(
+      builder, v.getLoc(),
+      RankedTensorType::get(shape, elementType, dotOperandEnc), newSmem,
+      asyncWaitToken.value_or(nullptr));
+  return prefetchSlice;
 }
 
 void Prefetcher::cloneElementwiseOps(Value &ret, const SmallVector<Value> &vals,
@@ -785,20 +790,21 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
   int nAxis = 1;
   int32_t numSlicesM = totalM / prefetchWidthM;
   SmallVector<RankedTensorType> typesBeforeSplitting;
-  SmallVector<Value> mSlices =
-      splitValueAlongAxis(cOperand, numSlicesM, mAxis, typesBeforeSplitting, loc, builder);
+  SmallVector<Value> mSlices = splitValueAlongAxis(
+      cOperand, numSlicesM, mAxis, typesBeforeSplitting, loc, builder);
   // Slice c opds along N
   int32_t numSlicesN = totalN / prefetchWidthN;
   for (int32_t mIdx = 0; mIdx < numSlicesM; ++mIdx) {
     int32_t mOff = mIdx * prefetchWidthM;
-    SmallVector<Value> mnSlices =
-        splitValueAlongAxis(mSlices[mIdx], numSlicesN, nAxis, typesBeforeSplitting, loc, builder);
+    SmallVector<Value> mnSlices = splitValueAlongAxis(
+        mSlices[mIdx], numSlicesN, nAxis, typesBeforeSplitting, loc, builder);
     for (int32_t nIdx = 0; nIdx < numSlicesN; ++nIdx) {
       int32_t nOff = nIdx * prefetchWidthN;
       mnToDot[{mOff, nOff}] = mnSlices[nIdx];
     }
   }
-  //assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be empty");
+  // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be
+  // empty");
 
   // For DotScaledOp, build (mOff,kOff) -> a_scale slice and (nOff,kOff) ->
   // b_scale slice
@@ -813,19 +819,21 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
         scaleFactor = 16;
       mKToAScale.emplace();
       Value aScaleMapped = mapping.lookup(aScaleVal);
-      SmallVector<Value> aScaleMSlices =
-          splitValueAlongAxis(aScaleMapped, numSlicesM, 0, typesBeforeSplitting, loc, builder);
+      SmallVector<Value> aScaleMSlices = splitValueAlongAxis(
+          aScaleMapped, numSlicesM, 0, typesBeforeSplitting, loc, builder);
       for (int32_t mIdx = 0; mIdx < numSlicesM; ++mIdx) {
         int32_t mOff = mIdx * prefetchWidthM;
-        SmallVector<Value> aScaleKSlices = splitValueAlongAxis(
-            aScaleMSlices[mIdx], numSlicesK, 1, typesBeforeSplitting, loc, builder);
+        SmallVector<Value> aScaleKSlices =
+            splitValueAlongAxis(aScaleMSlices[mIdx], numSlicesK, 1,
+                                typesBeforeSplitting, loc, builder);
         for (int32_t kIdx = 0; kIdx < numSlicesK; ++kIdx) {
           int32_t kOff = kIdx * prefetchWidthK;
           (*mKToAScale)[{mOff, kOff}] = aScaleKSlices[kIdx];
         }
       }
     }
-    //assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be empty");
+    // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should
+    // be empty");
 
     if (Value bScaleVal = scaledDot.getBScale()) {
       auto scaleTy = cast<RankedTensorType>(bScaleVal.getType());
@@ -833,19 +841,21 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
         scaleFactor = 16;
       nKToBScale.emplace();
       Value bScaleMapped = mapping.lookup(bScaleVal);
-      SmallVector<Value> bScaleNSlices =
-          splitValueAlongAxis(bScaleMapped, numSlicesN, 0, typesBeforeSplitting, loc, builder);
+      SmallVector<Value> bScaleNSlices = splitValueAlongAxis(
+          bScaleMapped, numSlicesN, 0, typesBeforeSplitting, loc, builder);
       for (int32_t nIdx = 0; nIdx < numSlicesN; ++nIdx) {
         int32_t nOff = nIdx * prefetchWidthN;
-        SmallVector<Value> bScaleKSlices = splitValueAlongAxis(
-            bScaleNSlices[nIdx], numSlicesK, 1, typesBeforeSplitting, loc, builder);
+        SmallVector<Value> bScaleKSlices =
+            splitValueAlongAxis(bScaleNSlices[nIdx], numSlicesK, 1,
+                                typesBeforeSplitting, loc, builder);
         for (int32_t kIdx = 0; kIdx < numSlicesK; ++kIdx) {
           int32_t kOff = kIdx * prefetchWidthK;
           (*nKToBScale)[{nOff, kOff}] = bScaleKSlices[kIdx];
         }
       }
     }
-    //assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be empty");
+    // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should
+    // be empty");
 
     (void)scaleFactor;
   }
@@ -916,17 +926,17 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
         }
 
         // TODO(dtanner) don't we want to slice scale_a and scale_b here?
-        
+
         if (lastDotOp)
           builder.setInsertionPointAfter(lastDotOp);
         if (tools::getBoolEnv("TRITON_HIP_PREFETCH_INSERT_SCHED_BARRIER")) {
-          int32_t mask = 0
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::valu
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::salu
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::all_vmem
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::vmem_read
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::vmem_write
-            | (int32_t) mlir::amdgpu::sched_barrier_opt_enum::transcendental;
+          int32_t mask =
+              0 | (int32_t)mlir::amdgpu::sched_barrier_opt_enum::valu |
+              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::salu |
+              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::all_vmem |
+              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_read |
+              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_write |
+              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::transcendental;
           ROCDL::SchedBarrier::create(builder, loc, mask);
         }
         Value cSlice = mnToDot[{mOff, nOff}];
@@ -952,11 +962,13 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
     for (int32_t nOff = 0; nOff < totalN; nOff += prefetchWidthN) {
       mnSlices.push_back(mnToDot[{mOff, nOff}]);
     }
-    Value mJoin = joinValuesAlongAxis(mnSlices, nAxis, typesBeforeSplitting, loc, builder);
+    Value mJoin = joinValuesAlongAxis(mnSlices, nAxis, typesBeforeSplitting,
+                                      loc, builder);
     mJoins.push_back(mJoin);
   }
   // Join d opds along M
-  Value result = joinValuesAlongAxis(mJoins, mAxis, typesBeforeSplitting, loc, builder);
+  Value result =
+      joinValuesAlongAxis(mJoins, mAxis, typesBeforeSplitting, loc, builder);
   Operation *newOp = result.getDefiningOp();
   // Reset insertion point to before the last dot for the prefetched local loads
   builder.setInsertionPoint(lastDotOp);
