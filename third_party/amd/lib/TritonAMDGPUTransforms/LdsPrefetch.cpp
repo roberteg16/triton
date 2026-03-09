@@ -32,12 +32,15 @@
 // local_loads and the dot which depends on them; data for the 0th dot is moved
 // to the end of the previous iteration.
 //
-// Currently, only a single dot per loop is supported.
-//
 // Prefetching *all* the A, B operands of dots from local memory would be
 // prohibitively expensive in terms of registers and cycles.
 // This supports slicing along K (which doesn't change the D, C operands
 // of the dot) and slicing along M and N.
+//
+// Currently, prefetching has the following restrictions
+// - Only a single dot per loop is supported; improving this relies on have the local_loads of one dot being placed inside another sliced dot.
+// - Intermediate ops between the dot and local_load are not supported; improving this requires being able to identify which ops (e.g. reshape, trans) support slicing and to what degree.
+// - DotScaled (with scales) is not supported; improving this requires creating new local_loads for scales which behave differently than operands.
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
@@ -58,7 +61,7 @@
 #include <tuple>
 
 #undef DEBUG_TYPE
-#define DEBUG_TYPE "tritongpu-prefetch"
+#define DEBUG_TYPE "tritonamdgpu-lds-prefetch"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
@@ -194,31 +197,23 @@ joinValuesAlongAxis(SmallVector<Value> tiles, int axis,
 }
 
 /// Create a new dot or dot_scaled op with the given slice operands.
-/// For DotScaledOp, scale slices must be provided via the optional maps.
+/// For DotScaledOp, scale operands are looked up from the mapping.
 static Operation *
 createDotOp(Operation *dotOp, OpBuilder &builder, Location loc,
             RankedTensorType dType, Value aSlice, Value bSlice, Value cSlice,
-            const DenseMap<std::pair<int32_t, int32_t>, Value> *mKToAScale,
-            const DenseMap<std::pair<int32_t, int32_t>, Value> *nKToBScale,
-            int32_t mOff, int32_t nOff, int32_t kOff) {
+            IRMapping *mapping) {
   if (auto dot = dyn_cast<triton::DotOp>(dotOp)) {
     return triton::DotOp::create(builder, loc, dType,
                                  ValueRange{aSlice, bSlice, cSlice},
                                  dot->getAttrs());
   }
   if (auto scaledDot = dyn_cast<triton::DotScaledOp>(dotOp)) {
-    Value aScale = Value();
-    Value bScale = Value();
-    if (mKToAScale) {
-      auto it = mKToAScale->find({mOff, kOff});
-      if (it != mKToAScale->end())
-        aScale = it->second;
-    }
-    if (nKToBScale) {
-      auto it = nKToBScale->find({nOff, kOff});
-      if (it != nKToBScale->end())
-        bScale = it->second;
-    }
+    Value aScale;
+    Value bScale;
+    if (Value v = scaledDot.getAScale())
+      aScale = mapping->lookup(v);
+    if (Value v = scaledDot.getBScale())
+      bScale = mapping->lookup(v);
     return triton::DotScaledOp::create(
         builder, loc, dType, aSlice, bSlice, cSlice, aScale, bScale,
         scaledDot.getAElemType(), scaledDot.getBElemType(),
@@ -314,6 +309,47 @@ private:
   unsigned kWidth;
 };
 
+// Walk back along def-use chain to find local_load
+// and return list of intermedate ops which may need to be sliced and prefetched.
+// Returns failure if chain contains ops which don't support slicing.
+FailureOr<SmallVector<Value>> findLocalLoad(Value v) {
+  // walk back to local_load
+  Operation *op = v.getDefiningOp();
+  bool foundLocalLoad = false;
+  // List of ops between dot and local_load which may all need to be sliced and prefetched.
+  SmallVector<Value> rets;
+  rets.push_back(op->getResult(0));
+  LDBG("Looking for local_load starting at: " << *op);
+  while (op) {
+    if (!op->getResult(0).hasOneUse()) {
+      // If the op has multiple uses, we would need to slice
+      // all downstream uses, which isn't supported.
+      return failure();
+    }
+    if (auto ll = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
+      // NYI for other encodings, for example if we have transpose
+      // in the chain
+      if (isa<triton::gpu::DotOperandEncodingAttr>(
+              ll.getType().getEncoding())) {
+        rets.push_back(op->getOperand(0));
+        foundLocalLoad = true;
+      }
+      break;
+    } else {
+      // TODO: support other ops between dot and local_load.
+      // rets.push_back(op->getOperand(0));
+      LDBG("unsupported op between dot and local_load: " << *op);
+      return failure();
+    }
+    op = op->getOperand(0).getDefiningOp();
+  }
+  std::reverse(rets.begin(), rets.end());
+
+  if (foundLocalLoad)
+    return rets;
+  return failure();
+}
+
 LogicalResult Prefetcher::initialize() {
   Block *loop = forOp.getBody();
 
@@ -322,58 +358,27 @@ LogicalResult Prefetcher::initialize() {
   };
 
   SmallVector<Operation *> dotsInFor;
-  for (Operation &op : *loop)
-    if (auto dotInterface = dyn_cast<triton::DotOpInterface>(&op)) {
-      // Only accepts dot ops encoded as Nvidia MMA v2 or AMD MFMA/WMMA
-      Value result = dotInterface.getD();
-      auto dstMfmaEnc =
-          dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(getEncoding(result));
-      auto dstWmmaEnc =
-          dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(getEncoding(result));
-      if (!dstMfmaEnc && !dstWmmaEnc)
-        // Don't rewrite if any other type is found.
+  for (Operation &op : *loop) {
+    if (auto dotScaled = dyn_cast<triton::DotScaledOp>(&op)) {
+      // TODO: need to support prefetching scales and slicing intermediate ops
+      // before supporting DotScaledOp.
+      if (dotScaled.getAScale() || dotScaled.getBScale()) {
+        LDBG("DotScaledOp with scales is not supported.");
+        LDBG(dotScaled);
         return failure();
+      }
+    }
+    if (auto dotInterface = dyn_cast<triton::DotOpInterface>(&op)) {
       dotsInFor.push_back(&op);
     }
-
+  }
   if (dotsInFor.empty())
     return failure();
 
-  // TODO: segfault (original for still has uses)
-  // when used in flash attention that has 2 dots in the loop
+  // TODO: enabling multiple dots per loop requires logic for prefetching
+  // one dot's local_load inside another dot.
   if (dotsInFor.size() > 1)
     return failure();
-
-  // returns source of cvt
-  auto getPrefetchSrc = [](Value v) -> SmallVector<Value> {
-    // walk back to conversion
-    Operation *op = v.getDefiningOp();
-    bool foundConvertFromShared = false;
-    SmallVector<Value> rets;
-    rets.push_back(op->getResult(0));
-    LDBG("Prefetch src: " << *op);
-    while (op) {
-      if (!op->getResult(0).hasOneUse())
-        break;
-      rets.push_back(op->getOperand(0));
-      if (auto cvt = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
-        // NYI for other encodings, for example if we have transpose
-        // in the chain
-        if (isa<triton::gpu::DotOperandEncodingAttr>(
-                cvt.getType().getEncoding()))
-          foundConvertFromShared = true;
-        break;
-      }
-      op = op->getOperand(0).getDefiningOp();
-      if (op)
-        LDBG("op: " << *op);
-    }
-    std::reverse(rets.begin(), rets.end());
-
-    if (foundConvertFromShared)
-      return rets;
-    return {};
-  };
 
   auto getIncomingOp = [this](Value v) -> Value {
     if (auto arg = mlir::dyn_cast<BlockArgument>(v))
@@ -421,6 +426,8 @@ LogicalResult Prefetcher::initialize() {
     bool transB = transOp(bOpd.getDefiningOp(), 1);
     Attribute dotEncoding =
         cast<RankedTensorType>(dot->getResult(0).getType()).getEncoding();
+    // TODO: calculating the prefetch(slicing) width also needs to examine
+    // how the intermediate ops (between dot and local_load) are sliceable.
     if (!computePrefetchWidthForDotType(
             dotEncoding, aType.getElementTypeBitWidth(), dType.getShape(),
             mSize, nSize, kSize, kWidth, transA, transB))
@@ -428,19 +435,19 @@ LogicalResult Prefetcher::initialize() {
     LDBG("prefetchWidthMNK: " << prefetchWidthM << "x" << prefetchWidthN << "x"
                               << prefetchWidthK);
     assert(prefetchWidthM > 0 && prefetchWidthN > 0 && prefetchWidthK > 0);
-    auto aVals = getPrefetchSrc(dotInterface.getA());
-    auto bVals = getPrefetchSrc(dotInterface.getB());
+    auto aVals = findLocalLoad(dotInterface.getA());
+    auto bVals = findLocalLoad(dotInterface.getB());
 
-    if (aVals.size() && bVals.size()) {
-      Value aSmem = aVals.front();
-      Value bSmem = bVals.front();
+    if (succeeded(aVals) && succeeded(bVals)) {
+      Value aSmem = aVals.value().front();
+      Value bSmem = bVals.value().front();
       Value aHeaderDef = getIncomingOp(aSmem);
       Value bHeaderDef = getIncomingOp(bSmem);
       // Only prefetch loop arg
       if (aHeaderDef && bHeaderDef) {
         dots.insert(dot);
-        dot2aVals[dot] = aVals;
-        dot2bVals[dot] = bVals;
+        dot2aVals[dot] = aVals.value();
+        dot2bVals[dot] = bVals.value();
         dot2aHeaderDef[dot] = aHeaderDef;
         dot2bHeaderDef[dot] = bHeaderDef;
         dot2aLoopArg[dot] = aSmem;
@@ -448,9 +455,11 @@ LogicalResult Prefetcher::initialize() {
         dot2aYield[dot] = getYieldOperand(aSmem);
         dot2bYield[dot] = getYieldOperand(bSmem);
       }
+    } else {
+      LDBG("findLocalLoad failed for dot: " << *dot);
+      return failure();
     }
   }
-
   return success();
 }
 
@@ -806,60 +815,6 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
   // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be
   // empty");
 
-  // For DotScaledOp, build (mOff,kOff) -> a_scale slice and (nOff,kOff) ->
-  // b_scale slice
-  std::optional<DenseMap<std::pair<int32_t, int32_t>, Value>> mKToAScale;
-  std::optional<DenseMap<std::pair<int32_t, int32_t>, Value>> nKToBScale;
-  if (auto scaledDot = dyn_cast<triton::DotScaledOp>(dotOp)) {
-    int32_t numSlicesK = totalK / prefetchWidthK;
-    int scaleFactor = 32;
-    if (Value aScaleVal = scaledDot.getAScale()) {
-      auto scaleTy = cast<RankedTensorType>(aScaleVal.getType());
-      if (isa<mlir::Float8E4M3FNType>(scaleTy.getElementType()))
-        scaleFactor = 16;
-      mKToAScale.emplace();
-      Value aScaleMapped = mapping.lookup(aScaleVal);
-      SmallVector<Value> aScaleMSlices = splitValueAlongAxis(
-          aScaleMapped, numSlicesM, 0, typesBeforeSplitting, loc, builder);
-      for (int32_t mIdx = 0; mIdx < numSlicesM; ++mIdx) {
-        int32_t mOff = mIdx * prefetchWidthM;
-        SmallVector<Value> aScaleKSlices =
-            splitValueAlongAxis(aScaleMSlices[mIdx], numSlicesK, 1,
-                                typesBeforeSplitting, loc, builder);
-        for (int32_t kIdx = 0; kIdx < numSlicesK; ++kIdx) {
-          int32_t kOff = kIdx * prefetchWidthK;
-          (*mKToAScale)[{mOff, kOff}] = aScaleKSlices[kIdx];
-        }
-      }
-    }
-    // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should
-    // be empty");
-
-    if (Value bScaleVal = scaledDot.getBScale()) {
-      auto scaleTy = cast<RankedTensorType>(bScaleVal.getType());
-      if (isa<mlir::Float8E4M3FNType>(scaleTy.getElementType()))
-        scaleFactor = 16;
-      nKToBScale.emplace();
-      Value bScaleMapped = mapping.lookup(bScaleVal);
-      SmallVector<Value> bScaleNSlices = splitValueAlongAxis(
-          bScaleMapped, numSlicesN, 0, typesBeforeSplitting, loc, builder);
-      for (int32_t nIdx = 0; nIdx < numSlicesN; ++nIdx) {
-        int32_t nOff = nIdx * prefetchWidthN;
-        SmallVector<Value> bScaleKSlices =
-            splitValueAlongAxis(bScaleNSlices[nIdx], numSlicesK, 1,
-                                typesBeforeSplitting, loc, builder);
-        for (int32_t kIdx = 0; kIdx < numSlicesK; ++kIdx) {
-          int32_t kOff = kIdx * prefetchWidthK;
-          (*nKToBScale)[{nOff, kOff}] = bScaleKSlices[kIdx];
-        }
-      }
-    }
-    // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should
-    // be empty");
-
-    (void)scaleFactor;
-  }
-
   // Generate dots[m, n, k] and local_loads[m, n, k] (except for local_load[0,
   // 0, 0] which is prefetched) Insertion point is manipulated to ensure
   // ordering of local_load[x+1] before dot[x]
@@ -925,8 +880,6 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
           }
         }
 
-        // TODO(dtanner) don't we want to slice scale_a and scale_b here?
-
         if (lastDotOp)
           builder.setInsertionPointAfter(lastDotOp);
         if (tools::getBoolEnv("TRITON_HIP_PREFETCH_INSERT_SCHED_BARRIER")) {
@@ -941,13 +894,9 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
         }
         Value cSlice = mnToDot[{mOff, nOff}];
         auto dType = cast<RankedTensorType>(cSlice.getType());
-        const DenseMap<std::pair<int32_t, int32_t>, Value> *aScaleMap =
-            mKToAScale ? &*mKToAScale : nullptr;
-        const DenseMap<std::pair<int32_t, int32_t>, Value> *bScaleMap =
-            nKToBScale ? &*nKToBScale : nullptr;
         Operation *newDot =
             createDotOp(dotOp, builder, loc, dType, aSlice, bSlice, cSlice,
-                        aScaleMap, bScaleMap, mOff, nOff, kOff);
+                        &mapping);
         mnToDot[{mOff, nOff}] = newDot->getResult(0);
         lastDotOp = newDot;
       }
@@ -1095,7 +1044,7 @@ struct TritonAMDGPULdsPrefetchPass
   using Base::Base;
 
   void runOnOperation() override {
-    llvm::outs() << "Running AMD's LdsPrefetch pass\n";
+    LDBG("Running AMD's LdsPrefetch pass");
     // Canonicalize convert ops to make the pattern matching easier.
     RewritePatternSet cleanUpPatterns(&getContext());
     triton::gpu::ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns,
@@ -1107,8 +1056,11 @@ struct TritonAMDGPULdsPrefetchPass
     getOperation()->walk([&](scf::ForOp forOp) {
       triton::amdgpu::Prefetcher prefetcher(forOp);
 
-      if (prefetcher.initialize().failed())
+      if (prefetcher.initialize().failed()) {
+        LDBG("Prefetching failed for loop.");
+        LDBG(forOp);
         return;
+      }
 
       prefetcher.emitPrologue();
 
@@ -1118,6 +1070,8 @@ struct TritonAMDGPULdsPrefetchPass
       for (unsigned i = 0; i < forOp->getNumResults(); ++i)
         forOp->getResult(i).replaceAllUsesWith(newForOp->getResult(i));
       forOp->erase();
+      LDBG("Prefetching succeeded for loop.");
+
     });
   }
 };
