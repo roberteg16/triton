@@ -344,7 +344,8 @@ FailureOr<SmallVector<Value>> findLocalLoad(Value v) {
       rets.push_back(op->getOperand(0));
     }
     op = op->getOperand(0).getDefiningOp();
-    LDBG("op between dot and local_load: " << *op);
+    if (op)
+      LDBG("op between dot and local_load: " << *op);
   }
   std::reverse(rets.begin(), rets.end());
 
@@ -412,10 +413,15 @@ LogicalResult Prefetcher::initialize() {
     LDBG("kWidth: " << kWidth);
 
     auto transOp = [&](Operation *op, int opdIdx) -> bool {
-      if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
-        auto srcType = localLoad.getSrc().getType();
-        auto order = getOrder(srcType);
-        return (order[0] == opdIdx);
+      while (op) {
+        if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
+          auto srcType = localLoad.getSrc().getType();
+          auto order = getOrder(srcType);
+          return (order[0] == opdIdx);
+        }
+        if (op->getNumOperands() < 1)
+          break;
+        op = op->getOperand(0).getDefiningOp();
       }
       return true;
     };
@@ -627,6 +633,8 @@ std::tuple<unsigned, unsigned, unsigned> Prefetcher::computePrefetchWidth(
   // minimum transpose width
   ModuleOp module = this->forOp.getOperation()->getParentOfType<ModuleOp>();
   std::optional<StringRef> arch = getAMDArch(module);
+  if (!arch)
+    return {mSize, nSize, kSize};
   std::string archStr = arch->str();
   unsigned mtw = 32;
   if (archStr == "gfx1250") {
@@ -996,7 +1004,6 @@ FailureOr<Value> Prefetcher::getAsyncWaitTokenForLocalLoad(Operation *cvt,
         assert(false && "Expected async wait token to be loop arg.");
         return failure();
       }
-      return awt;
     } else {
       // Case 1: return new async wait token from for(args) for
       // LocalLoad[1, N-1].
