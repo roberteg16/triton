@@ -327,21 +327,24 @@ FailureOr<SmallVector<Value>> findLocalLoad(Value v) {
       return failure();
     }
     if (auto ll = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
-      // NYI for other encodings, for example if we have transpose
-      // in the chain
       if (isa<triton::gpu::DotOperandEncodingAttr>(
               ll.getType().getEncoding())) {
         rets.push_back(op->getOperand(0));
         foundLocalLoad = true;
+        break;
       }
-      break;
-    } else {
-      // TODO: support other ops between dot and local_load.
-      // rets.push_back(op->getOperand(0));
-      LDBG("unsupported op between dot and local_load: " << *op);
+      // NYI for other encodings, for example if we have transpose
+      // in the chain.
       return failure();
+    } else {
+      if (op->getNumOperands() != 1)
+        return failure();
+      // TODO: not all  ops between dot and local_load are elementwise sliceable,
+      // e.g. reshape and transpose will be needed for scale preshuffle.
+      rets.push_back(op->getOperand(0));
     }
     op = op->getOperand(0).getDefiningOp();
+    LDBG("op between dot and local_load: " << *op);
   }
   std::reverse(rets.begin(), rets.end());
 
