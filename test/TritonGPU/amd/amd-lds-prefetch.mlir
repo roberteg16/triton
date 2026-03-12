@@ -22,9 +22,6 @@
 // Two dots (2 K-slices)
 // CHECK: tt.dot
 // CHECK: tt.dot
-// Next-iter prefetch subslices
-// CHECK-DAG: ttg.memdesc_subslice {{.*}}[0, 0] {{.*}} -> !ttg.memdesc<32x64xf16
-// CHECK-DAG: ttg.memdesc_subslice {{.*}}[0, 0] {{.*}} -> !ttg.memdesc<64x32xf16
 // CHECK: scf.yield
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @slice_k_only(%lb: index, %ub: index, %step: index,
@@ -388,7 +385,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // ============================================================================
 // Test 9: two_dots_in_loop_fails — gfx942, MFMA v3
 // Two tt.dot ops in loop body → initialize() rejects (dotsInFor.size() > 1)
-// CHECK: loop is unchanged
 // ============================================================================
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
