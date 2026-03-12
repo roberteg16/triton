@@ -38,9 +38,13 @@
 // of the dot) and slicing along M and N.
 //
 // Currently, prefetching has the following restrictions
-// - Only a single dot per loop is supported; improving this relies on have the local_loads of one dot being placed inside another sliced dot.
-// - Intermediate ops between the dot and local_load are not supported; improving this requires being able to identify which ops (e.g. reshape, trans) support slicing and to what degree.
-// - DotScaled (with scales) is not supported; improving this requires creating new local_loads for scales which behave differently than operands.
+// - Only a single dot per loop is supported; improving this relies on have the
+// local_loads of one dot being placed inside another sliced dot.
+// - Intermediate ops between the dot and local_load are not supported;
+// improving this requires being able to identify which ops (e.g. reshape,
+// trans) support slicing and to what degree.
+// - DotScaled (with scales) is not supported; improving this requires creating
+// new local_loads for scales which behave differently than operands.
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
@@ -198,10 +202,10 @@ joinValuesAlongAxis(SmallVector<Value> tiles, int axis,
 
 /// Create a new dot or dot_scaled op with the given slice operands.
 /// For DotScaledOp, scale operands are looked up from the mapping.
-static Operation *
-createDotOp(Operation *dotOp, OpBuilder &builder, Location loc,
-            RankedTensorType dType, Value aSlice, Value bSlice, Value cSlice,
-            IRMapping *mapping) {
+static Operation *createDotOp(Operation *dotOp, OpBuilder &builder,
+                              Location loc, RankedTensorType dType,
+                              Value aSlice, Value bSlice, Value cSlice,
+                              IRMapping *mapping) {
   if (auto dot = dyn_cast<triton::DotOp>(dotOp)) {
     return triton::DotOp::create(builder, loc, dType,
                                  ValueRange{aSlice, bSlice, cSlice},
@@ -310,13 +314,15 @@ private:
 };
 
 // Walk back along def-use chain to find local_load
-// and return list of intermedate ops which may need to be sliced and prefetched.
-// Returns failure if chain contains ops which don't support slicing.
+// and return list of intermedate ops which may need to be sliced and
+// prefetched. Returns failure if chain contains ops which don't support
+// slicing.
 FailureOr<SmallVector<Value>> findLocalLoad(Value v) {
   // walk back to local_load
   Operation *op = v.getDefiningOp();
   bool foundLocalLoad = false;
-  // List of ops between dot and local_load which may all need to be sliced and prefetched.
+  // List of ops between dot and local_load which may all need to be sliced and
+  // prefetched.
   SmallVector<Value> rets;
   rets.push_back(op->getResult(0));
   LDBG("Looking for local_load starting at: " << *op);
@@ -339,8 +345,9 @@ FailureOr<SmallVector<Value>> findLocalLoad(Value v) {
     } else {
       if (op->getNumOperands() != 1)
         return failure();
-      // TODO: not all  ops between dot and local_load are elementwise sliceable,
-      // e.g. reshape and transpose will be needed for scale preshuffle.
+      // TODO: not all  ops between dot and local_load are elementwise
+      // sliceable, e.g. reshape and transpose will be needed for scale
+      // preshuffle.
       rets.push_back(op->getOperand(0));
     }
     op = op->getOperand(0).getDefiningOp();
@@ -905,9 +912,8 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
         }
         Value cSlice = mnToDot[{mOff, nOff}];
         auto dType = cast<RankedTensorType>(cSlice.getType());
-        Operation *newDot =
-            createDotOp(dotOp, builder, loc, dType, aSlice, bSlice, cSlice,
-                        &mapping);
+        Operation *newDot = createDotOp(dotOp, builder, loc, dType, aSlice,
+                                        bSlice, cSlice, &mapping);
         mnToDot[{mOff, nOff}] = newDot->getResult(0);
         lastDotOp = newDot;
       }
@@ -1081,7 +1087,6 @@ struct TritonAMDGPULdsPrefetchPass
         forOp->getResult(i).replaceAllUsesWith(newForOp->getResult(i));
       forOp->erase();
       LDBG("Prefetching succeeded for loop.");
-
     });
   }
 };
