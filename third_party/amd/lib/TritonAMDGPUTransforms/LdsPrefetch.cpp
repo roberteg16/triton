@@ -53,6 +53,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -830,8 +831,6 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
       mnToDot[{mOff, nOff}] = mnSlices[nIdx];
     }
   }
-  // assert(typesBeforeSplitting.size() == 0 && "typesBeforeSplitting should be
-  // empty");
 
   // Generate dots[m, n, k] and local_loads[m, n, k] (except for local_load[0,
   // 0, 0] which is prefetched) Insertion point is manipulated to ensure
@@ -900,16 +899,14 @@ Operation *Prefetcher::generateDotsAndNonPrefetchingLocalLoads(
 
         if (lastDotOp)
           builder.setInsertionPointAfter(lastDotOp);
-        if (tools::getBoolEnv("TRITON_HIP_PREFETCH_INSERT_SCHED_BARRIER")) {
-          int32_t mask =
-              0 | (int32_t)mlir::amdgpu::sched_barrier_opt_enum::valu |
-              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::salu |
-              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::all_vmem |
-              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_read |
-              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_write |
-              (int32_t)mlir::amdgpu::sched_barrier_opt_enum::transcendental;
-          ROCDL::SchedBarrier::create(builder, loc, mask);
-        }
+        int32_t mask =
+            0 | (int32_t)mlir::amdgpu::sched_barrier_opt_enum::valu |
+            (int32_t)mlir::amdgpu::sched_barrier_opt_enum::salu |
+            (int32_t)mlir::amdgpu::sched_barrier_opt_enum::all_vmem |
+            (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_read |
+            (int32_t)mlir::amdgpu::sched_barrier_opt_enum::vmem_write |
+            (int32_t)mlir::amdgpu::sched_barrier_opt_enum::transcendental;
+        ROCDL::SchedBarrier::create(builder, loc, mask);
         Value cSlice = mnToDot[{mOff, nOff}];
         auto dType = cast<RankedTensorType>(cSlice.getType());
         Operation *newDot = createDotOp(dotOp, builder, loc, dType, aSlice,
@@ -1055,12 +1052,18 @@ FailureOr<Value> Prefetcher::getAsyncWaitTokenForLocalLoad(Operation *cvt,
 } // namespace amdgpu
 } // namespace triton
 
+static bool hasPrecedingCondBarrier(scf::ForOp forOp) {
+  for (Operation *op = forOp->getPrevNode(); op; op = op->getPrevNode())
+    if (isa<triton::amdgpu::CondBarrierOp>(op))
+      return true;
+  return false;
+}
+
 struct TritonAMDGPULdsPrefetchPass
     : public impl::TritonAMDGPULdsPrefetchBase<TritonAMDGPULdsPrefetchPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    LDBG("Running AMD's LdsPrefetch pass");
     // Canonicalize convert ops to make the pattern matching easier.
     RewritePatternSet cleanUpPatterns(&getContext());
     triton::gpu::ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns,
@@ -1070,11 +1073,17 @@ struct TritonAMDGPULdsPrefetchPass
       signalPassFailure();
     }
     getOperation()->walk([&](scf::ForOp forOp) {
+      // Don't run LdsPrefetch on loops preceded by a conditional barrier,
+      // as this signifies that PingPong scheduling succeeded.
+      if (hasPrecedingCondBarrier(forOp)) {
+        LDBG("Skipping loop (CondBarrierOp signifies PingPong).");
+        return;
+      }
+
       triton::amdgpu::Prefetcher prefetcher(forOp);
 
       if (prefetcher.initialize().failed()) {
-        LDBG("Prefetching failed for loop.");
-        LDBG(forOp);
+        LDBG("Prefetching failed.");
         return;
       }
 
@@ -1086,7 +1095,7 @@ struct TritonAMDGPULdsPrefetchPass
       for (unsigned i = 0; i < forOp->getNumResults(); ++i)
         forOp->getResult(i).replaceAllUsesWith(newForOp->getResult(i));
       forOp->erase();
-      LDBG("Prefetching succeeded for loop.");
+      LDBG("Prefetching succeeded.");
     });
   }
 };
