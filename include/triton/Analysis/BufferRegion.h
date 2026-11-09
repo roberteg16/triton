@@ -353,6 +353,14 @@ public:
   /// accesses.
   const BufferRegionFootprint *getScratchFootprint(Operation *op);
 
+  /// The shared-memory addresses each warp touches when a tensor of type
+  /// `registers` is stored to or loaded from `value`, indexed by warp and
+  /// covering every possible view and the storage reserved by zero allocation
+  /// bases. Null for unknown views, several CTAs, partitioned or pipelined
+  /// descriptors, and shapes that differ from the descriptor's.
+  const llvm::SmallVector<AddressSet> *
+  getWarpFootprints(Value value, RankedTensorType registers);
+
   /// Translate callee-local views into the caller's allocation frame, caching
   /// the complete footprint and preserving views already in other frames.
   const BufferRegionFootprint *
@@ -425,6 +433,9 @@ private:
   llvm::DenseMap<std::pair<const BufferRegionFootprint *, Operation *>,
                  std::unique_ptr<BufferRegionFootprint>>
       callsiteFootprints;
+  llvm::DenseMap<std::pair<Value, Type>,
+                 std::unique_ptr<llvm::SmallVector<AddressSet>>>
+      warpFootprints;
   llvm::UniqueVector<Operation *> operationInterner;
 };
 

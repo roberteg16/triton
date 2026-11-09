@@ -22,10 +22,10 @@ tt.func @pipelined_async_copy_local_to_global(%A: !tt.ptr<f16>) {
   // Load into TileB
   %3 = ttg.async_copy_global_to_local %a_ptr, %tile_b : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
   // There should be a single barrier after async_wait
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: ttg.async_wait
   // CHECK-NEXT: ttg.barrier local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: tt.return
   tt.return
 }
@@ -47,10 +47,10 @@ tt.func @pipelined_async_copy_local_to_global_2(%A: !tt.ptr<f16>) {
   // Read TileA
   %4 = ttg.local_load %tile_a token %2 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
   // There should be a single barrier after async_wait
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: ttg.async_wait
   // CHECK-NEXT: ttg.barrier local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: tt.return
   tt.return
 }
@@ -86,10 +86,10 @@ tt.func @pipelined_async_copy_local_to_global_3(%A: !tt.ptr<f16>, %B: !tt.ptr<f1
   %7 = ttg.async_copy_global_to_local %b_ptr, %tile_b_2 : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
 
   // There should be a single barrier after async_wait
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: ttg.async_wait
   // CHECK-NEXT: ttg.barrier local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: tt.return
   tt.return
 }
@@ -106,7 +106,7 @@ tt.func @async_wait_in_previous_loop_iteration(%a_ptr: tensor<16x16x!tt.ptr<f16>
   %2 = ttg.async_wait %1 {num = 4 : i32}
 
   // CHECK: ttg.async_wait
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: cf.br
   %loop_result:1 = scf.for %arg14 = %c0_i32 to %loopIterCount step %c1_i32 iter_args(%arg10 = %2) -> (!ttg.async.token)  : i32 {
     // CHECK: ttg.barrier local
@@ -116,10 +116,10 @@ tt.func @async_wait_in_previous_loop_iteration(%a_ptr: tensor<16x16x!tt.ptr<f16>
     %6 = ttg.local_load %alloc token %arg10 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
     %7 = ttg.async_copy_global_to_local %a_ptr, %alloc : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
 
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: ttg.async_wait
     %8 = ttg.async_wait %7 {num = 4 : i32}
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: cf.br
     scf.yield %8: !ttg.async.token
   }
@@ -357,7 +357,7 @@ tt.func @disjoint_tdm_copy_remsi(%desc: !tt.tensordesc<128x128xf16, #shared>, %p
   // CHECK: amdg.async_tdm_copy_global_to_local
   %copy_desc = amdg.update_tensor_descriptor %desc add_offsets = [%c0_i32, %c0_i32] pred = %c_pred {clamp_bounds} : !tt.tensordesc<128x128xf16, #shared>
   %token = amdg.async_tdm_copy_global_to_local %copy_desc into %write_view : !tt.tensordesc<128x128xf16, #shared> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: ttg.local_load
   %load = ttg.local_load %read_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
   tt.return
@@ -384,10 +384,11 @@ tt.func @disjoint_select_cmpi_iter_arg_cf(%cst: tensor<128x128xf16, #AL>, %ub: i
     %r_idx = arith.remsi %phase, %c3_i32 : i32
     %r_view = ttg.memdesc_index %alloc[%r_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
-    // CHECK: ttg.barrier local
+    // Each warp of #AL stores and loads the same rows of a slot.
+    // CHECK: ttg.barrier warp local
     // CHECK: ttg.local_store
     ttg.local_store %cst, %w_view : tensor<128x128xf16, #AL> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: ttg.local_load
     %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
 
@@ -413,14 +414,15 @@ tt.func @disjoint_remsi_loop_carried_cf(%cst: tensor<128x128xf16, #AL>, %ub: i32
   %res = scf.for %i = %c0_i32 to %ub step %c1_i32 iter_args(%phase = %c0_i32) -> (i32) : i32 {
     %r_idx = arith.remsi %phase, %c3_i32 : i32
     %r_view = ttg.memdesc_index %alloc[%r_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    // CHECK: ttg.barrier local
+    // Each warp of #AL stores and loads the same rows of a slot.
+    // CHECK: ttg.barrier warp local
     // CHECK-NEXT: ttg.local_load
     %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
 
     %w_sum = arith.addi %phase, %c1_i32 : i32
     %w_idx = arith.remsi %w_sum, %c3_i32 : i32
     %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: ttg.local_store
     ttg.local_store %cst, %w_view : tensor<128x128xf16, #AL> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
@@ -445,14 +447,15 @@ tt.func @must_barrier_remsi_loop_carried_future_disjoint_cf(%cst: tensor<128x128
   %res = scf.for %i = %c0_i32 to %ub step %c1_i32 iter_args(%phase = %c0_i32) -> (i32) : i32 {
     %r_idx = arith.remsi %phase, %c4_i32 : i32
     %r_view = ttg.memdesc_index %alloc[%r_idx] : !ttg.memdesc<4x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    // CHECK: ttg.barrier local
+    // Each warp of #AL stores and loads the same rows of a slot.
+    // CHECK: ttg.barrier warp local
     // CHECK-NEXT: ttg.local_load
     %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
 
     %w_sum = arith.addi %phase, %c1_i32 : i32
     %w_idx = arith.remsi %w_sum, %c4_i32 : i32
     %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<4x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: ttg.local_store
     ttg.local_store %cst, %w_view : tensor<128x128xf16, #AL> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
@@ -477,7 +480,7 @@ tt.func @no_barrier_between_async_loads(%A: !tt.ptr<f16>, %i: i32, %j: i32) {
   %tile_a = ttg.memdesc_index %alloc[%i] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   %tile_b = ttg.memdesc_index %alloc[%j] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   // CHECK: amdg.buffer_load_to_local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: amdg.buffer_load_to_local
   %async_a = amdg.buffer_load_to_local %A[%offset] into %tile_a : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
   %async_b = amdg.buffer_load_to_local %A[%offset] into %tile_b : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
@@ -510,26 +513,26 @@ tt.func @no_barrier_between_async_loads_in_pipelined_loop(%A: !tt.ptr<f16>, %ub:
 
   %s0 = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   // CHECK: amdg.buffer_load_to_local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   %ld0 = amdg.buffer_load_to_local %A[%offset] into %s0 : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
   ttg.async_commit_group
 
   %s1 = ttg.memdesc_index %alloc[%c1_i32] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   // CHECK: amdg.buffer_load_to_local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   %ld1 = amdg.buffer_load_to_local %A[%offset] into %s1 : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
   ttg.async_commit_group
 
   // CHECK: cf.br
   %res = scf.for %iv = %c0_i32 to %ub step %c1_i32 iter_args(%i = %c2_i32) -> (i32) : i32 {
     %si = ttg.memdesc_index %alloc[%i] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: amdg.buffer_load_to_local
     %ldi = amdg.buffer_load_to_local %A[%offset] into %si : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
     ttg.async_commit_group
 
     // CHECK: ttg.async_wait
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     ttg.async_wait {num = 2 : i32}
 
     %ip1 = arith.addi %i, %c1_i32 : i32
@@ -568,7 +571,7 @@ tt.func @tdm_refill_after_synced_local_load(%desc: !tt.tensordesc<128x128xf16, #
   %tok0 = amdg.async_tdm_copy_global_to_local %d into %r : !tt.tensordesc<128x128xf16, #shared> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   // CHECK: amdg.async_wait
   // CHECK-NEXT: ttg.barrier local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   %wait = amdg.async_wait %tok0 {num_inst = 0 : i32}
   // CHECK: ttg.local_load
   // CHECK-NEXT: ttg.barrier local
@@ -600,26 +603,26 @@ tt.func @pipelined_loop_refill_after_synced_local_load(%A: !tt.ptr<f16>, %ub: i3
 
   %s0 = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   // CHECK: amdg.buffer_load_to_local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   %ld0 = amdg.buffer_load_to_local %A[%offset] into %s0 : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
   %cg0 = ttg.async_commit_group tokens %ld0
 
   %s1 = ttg.memdesc_index %alloc[%c1_i32] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
   // CHECK: amdg.buffer_load_to_local
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   %ld1 = amdg.buffer_load_to_local %A[%offset] into %s1 : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
   %cg1 = ttg.async_commit_group tokens %ld1
 
   // CHECK: cf.br
   %res = scf.for %iv = %c0_i32 to %ub step %c1_i32 iter_args(%i = %c2_i32) -> (i32) : i32 {
     %si = ttg.memdesc_index %alloc[%i] : !ttg.memdesc<3x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: amdg.buffer_load_to_local
     %ldi = amdg.buffer_load_to_local %A[%offset] into %si : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
     %cgi = ttg.async_commit_group tokens %ldi
 
     // CHECK: ttg.async_wait
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     %w = ttg.async_wait %cgi {num = 2 : i32}
 
     %ip1 = arith.addi %i, %c1_i32 : i32
@@ -634,7 +637,7 @@ tt.func @pipelined_loop_refill_after_synced_local_load(%A: !tt.ptr<f16>, %ub: i3
     %ldj = amdg.buffer_load_to_local %A[%offset] into %sj : !tt.ptr<f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #shared, #smem, mutable>
     %cgj = ttg.async_commit_group tokens %ldj
 
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: cf.br
     scf.yield %j : i32
   }
@@ -659,16 +662,16 @@ tt.func @no_barrier_between_tdm_copies_with_mbarrier(
   %smem = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
   amdg.init_barrier %bar, 8 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: amdg.async_tdm_copy_global_to_local
   %token = amdg.async_tdm_copy_global_to_local %in into %smem, barrier = %bar : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: amdg.wait_barrier
   amdg.wait_barrier %bar, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: amdg.async_tdm_copy_local_to_global
   amdg.async_tdm_copy_local_to_global %out from %smem, barrier = %bar : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
-  // CHECK-NOT: ttg.barrier local
+  // CHECK-NOT: ttg.barrier {{(warp )?}}local
   // CHECK: tt.return
   tt.return
 }
@@ -727,16 +730,16 @@ tt.func @no_barrier_tdm_mbarrier_in_loop(
   amdg.init_barrier %barS, 16 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
   // CHECK: cf.br
   scf.for %i = %c0_i32 to %ub step %c1_i32 : i32 {
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: amdg.async_tdm_copy_global_to_local
     %t = amdg.async_tdm_copy_global_to_local %in into %smem, barrier = %barL : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     amdg.wait_barrier %barL, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: amdg.async_tdm_copy_local_to_global
     amdg.async_tdm_copy_local_to_global %o0 from %smem, barrier = %barS : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
     amdg.async_tdm_copy_local_to_global %o1 from %smem, barrier = %barS : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
     amdg.wait_barrier %barS, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
   }
   // CHECK: tt.return
   tt.return
@@ -818,11 +821,11 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // CHECK-NEXT: cf.cond_br
     cf.cond_br %condition, ^left(%condition : i1), ^right(%condition : i1)
   ^left(%lhs: i1):
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     ttg.barrier local
     tt.return %lhs : i1
   ^right(%rhs: i1):
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     ttg.barrier local
     tt.return %rhs : i1
   }
@@ -863,7 +866,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
   ^header(%older: i32, %newer: i32):
     cf.cond_br %condition, ^body, ^exit
   ^body:
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     ttg.barrier local
     %next = tt.load %ptr : !tt.ptr<i32>
     ttg.async_wait {num = 2 : i32}
@@ -872,7 +875,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // CHECK-NEXT: cf.br
     cf.br ^header(%newer, %next : i32, i32)
   ^exit:
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     ttg.barrier local
     tt.return %older : i32
   }
@@ -894,7 +897,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // CHECK: ttg.barrier local
     // CHECK-NEXT: {{.*}} = arith.addi
     %sum = arith.addi %value, %value : i32
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: tt.return
     ttg.barrier local
     tt.return %sum : i32
@@ -954,7 +957,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // CHECK-NEXT: {{.*}} = arith.addf
     %sum = arith.addf %loaded, %loaded : f16
     %tile = ttg.local_load %buffer token %wait : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
-    // CHECK-NOT: ttg.barrier local
+    // CHECK-NOT: ttg.barrier {{(warp )?}}local
     // CHECK: tt.return
     tt.return %sum : f16
   }

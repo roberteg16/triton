@@ -100,13 +100,20 @@ triton::AddressSet &getAddressesForCTA(MemDescFootprint &footprint,
   return it->second;
 }
 
+// Physical addresses of the logical points origin ^ span(generators) of `ty`,
+// including the storage reserved by zero allocation bases.
+MemDescFootprint getMemDescPointAddresses(
+    uint32_t storageBase, uint32_t affineOffset, ttg::MemDescType ty,
+    ArrayRef<int32_t> origin, ArrayRef<SmallVector<int32_t>> generators,
+    ArrayRef<uint32_t> partitionBases, uint32_t affinePartitionOffset,
+    uint32_t affineCTAOffset);
+
 MemDescFootprint getMemDescAddresses(
     uint32_t storageBase, uint32_t affineOffset, ttg::MemDescType ty,
     llvm::DenseMap<std::pair<Type, uint32_t>, MemDescFootprint> *cache =
         nullptr,
     ArrayRef<uint32_t> partitionBases = {}, uint32_t affinePartitionOffset = 0,
     uint32_t affineCTAOffset = 0) {
-  bool isTmem = isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace());
   if (cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank() !=
       ty.getRank()) {
     ttg::MemDescType pageTy =
@@ -134,14 +141,32 @@ MemDescFootprint getMemDescAddresses(
           addresses.translated(storageBase);
     return footprint;
   }
+  // Every logical point: the bits of each dimension.
+  SmallVector<SmallVector<int32_t>> generators;
+  for (auto [dimIndex, dimSize] : llvm::enumerate(ty.getShape()))
+    for (unsigned bit = 0; bit < llvm::Log2_64(dimSize); ++bit) {
+      SmallVector<int32_t> unit(ty.getRank(), 0);
+      unit[dimIndex] = 1 << bit;
+      generators.push_back(std::move(unit));
+    }
+  return getMemDescPointAddresses(
+      storageBase, affineOffset, ty, SmallVector<int32_t>(ty.getRank(), 0),
+      generators, partitionBases, affinePartitionOffset, affineCTAOffset);
+}
+
+MemDescFootprint getMemDescPointAddresses(
+    uint32_t storageBase, uint32_t affineOffset, ttg::MemDescType ty,
+    ArrayRef<int32_t> origin, ArrayRef<SmallVector<int32_t>> generators,
+    ArrayRef<uint32_t> partitionBases, uint32_t affinePartitionOffset,
+    uint32_t affineCTAOffset) {
+  bool isTmem = isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace());
   triton::LinearLayout layout = ttg::toLinearLayoutIgnoringPadding(
       ttg::dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()),
       ty.getEncoding());
   triton::LinearLayout inverse = layout.pseudoinvert();
   MLIRContext *ctx = ty.getContext();
   SmallVector<StringAttr> dims = triton::standardOutDimNames(ctx, ty.getRank());
-  ArrayRef<int64_t> shape = ty.getShape();
-  uint64_t numPoints = product(shape);
+  uint64_t numPoints = uint64_t{1} << generators.size();
   uint32_t bitWidth = getIntOrFloatOrPtrBitWidth(ty.getElementType());
 
   StringAttr offsetName = StringAttr::get(ctx, "offset");
@@ -182,20 +207,30 @@ MemDescFootprint getMemDescAddresses(
     uint32_t partition = 0;
     uint32_t block = 0;
   };
-  SmallVector<PhysicalBasis> bases;
-  for (auto [dim, dimSize] : llvm::zip_equal(dims, shape)) {
-    unsigned numBits = llvm::Log2_64(dimSize);
-    for (unsigned bit = 0; bit < numBits; ++bit) {
-      auto basis = [&, dim = dim](StringAttr name) {
-        return inverse.hasOutDim(name)
-                   ? static_cast<uint32_t>(inverse.getBasis(dim, bit, name))
-                   : 0;
-      };
-      uint32_t block = basis(blockName);
-      bases.push_back({basis(offsetName), basis(rowName), basis(colName),
-                       basis(partitionName), block});
+  // The layout is linear, so a logical point maps to the XOR of its bits.
+  auto toPhysical = [&](ArrayRef<int32_t> point) {
+    SmallVector<std::pair<StringAttr, int32_t>> logical;
+    for (auto [dim, value] : llvm::zip_equal(dims, point))
+      logical.emplace_back(dim, value);
+    PhysicalBasis physical;
+    for (auto [name, value] : inverse.apply(logical)) {
+      uint32_t bits = static_cast<uint32_t>(value);
+      if (name == offsetName)
+        physical.offset = bits;
+      else if (name == rowName)
+        physical.row = bits;
+      else if (name == colName)
+        physical.col = bits;
+      else if (name == partitionName)
+        physical.partition = bits;
+      else if (name == blockName)
+        physical.block = bits;
     }
-  }
+    return physical;
+  };
+  SmallVector<PhysicalBasis> bases;
+  for (ArrayRef<int32_t> generator : generators)
+    bases.push_back(toPhysical(generator));
   // Include storage reserved by zero allocation bases, but not bases excluded
   // by the subview. The pseudoinverse above selects only one representative.
   for (StringAttr dim : layout.getInDimNames()) {
@@ -213,7 +248,7 @@ MemDescFootprint getMemDescAddresses(
     }
   }
 
-  PhysicalBasis physical;
+  PhysicalBasis physical = toPhysical(origin);
   for (uint64_t index = 0; index < numPoints; ++index) {
     if (index != 0) {
       const PhysicalBasis &basis = bases[llvm::countr_zero(index)];
@@ -598,6 +633,65 @@ BufferRegionAnalysis::getFootprint(Value value,
       }))
     return nullptr;
   return footprint;
+}
+
+const SmallVector<AddressSet> *
+BufferRegionAnalysis::getWarpFootprints(Value value,
+                                        RankedTensorType registers) {
+  auto [it, inserted] =
+      warpFootprints.try_emplace(std::make_pair(value, Type(registers)));
+  if (!inserted)
+    return it->second.get();
+
+  auto memory = dyn_cast<ttg::MemDescType>(value.getType());
+  if (!memory || !isa<ttg::SharedMemorySpaceAttr>(memory.getMemorySpace()) ||
+      cast<ttg::LayoutEncodingTrait>(memory.getEncoding()).getRank() !=
+          memory.getRank() ||
+      memory.getShape() != registers.getShape() || !registers.getEncoding())
+    return nullptr;
+  const RegionInfo &info = getRegionInfo(value);
+  if (info.kind != RegionInfo::Kind::Exact || info.views.empty())
+    return nullptr;
+
+  MLIRContext *ctx = value.getContext();
+  StringAttr kRegister = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  StringAttr kWarp = StringAttr::get(ctx, "warp");
+  StringAttr kBlock = StringAttr::get(ctx, "block");
+  LinearLayout layout = ttg::toLinearLayout(registers);
+  if (layout.getInDimSize(kBlock) != 1 ||
+      !llvm::equal(layout.getOutDimNames(),
+                   triton::standardOutDimNames(ctx, memory.getRank())))
+    return nullptr;
+
+  // A warp's points: its first point, spanned by the register and lane bases.
+  SmallVector<SmallVector<int32_t>> generators;
+  for (StringAttr dim : {kRegister, kLane})
+    for (int32_t i = 0; i < layout.getInDimSizeLog2(dim); ++i) {
+      ArrayRef<int32_t> basis = layout.getBasis(dim, i);
+      if (llvm::any_of(basis, [](int32_t x) { return x != 0; }))
+        generators.push_back(llvm::to_vector(basis));
+    }
+
+  auto result = std::make_unique<SmallVector<AddressSet>>();
+  for (int32_t warp = 0; warp < layout.getInDimSize(kWarp); ++warp) {
+    SmallVector<int32_t> origin;
+    for (auto [dim, x] :
+         layout.apply({{kRegister, 0}, {kLane, 0}, {kWarp, warp}, {kBlock, 0}}))
+      origin.push_back(x);
+    AddressSet &addresses = result->emplace_back();
+    for (const BufferRegionView &view : info.views) {
+      if (!view.partitionBases.empty())
+        return nullptr;
+      for (const auto &[cta, set] : getMemDescPointAddresses(
+               view.storageBase, view.affineOffset, memory, origin, generators,
+               view.partitionBases, view.affinePartitionOffset,
+               view.affineCTAOffset))
+        addresses.insert(set);
+    }
+  }
+  it->second = std::move(result);
+  return it->second.get();
 }
 
 const BufferRegionFootprint *

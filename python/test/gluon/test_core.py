@@ -492,6 +492,39 @@ def test_noinline_call_preserves_live_shared_allocation(NESTED, fresh_knobs):
     torch.testing.assert_close(sentinel_output, torch.arange(128, device="cuda", dtype=torch.int32) + 4096)
 
 
+@gluon.jit
+def _membar_loop_kernel(out, ITERS: ttgl.constexpr, BLOCK: ttgl.constexpr, store_layout: ttgl.constexpr,
+                        load_layout: ttgl.constexpr):
+    smem = ttgl.allocate_shared_memory(ttgl.int32, [BLOCK], ttgl.SwizzledSharedLayout(1, 1, 1, [0]))
+    stored = ttgl.arange(0, BLOCK, layout=store_layout) * ITERS
+    acc = ttgl.zeros([BLOCK], ttgl.int32, load_layout)
+    for i in range(ITERS):
+        smem.store(stored + i)
+        acc += smem.load(load_layout)
+    ttgl.store(out + ttgl.arange(0, BLOCK, layout=load_layout), acc)
+
+
+@pytest.mark.skipif(not (is_ampere_or_newer() or is_hip()), reason="Requires Ampere or newer, or AMD")
+@pytest.mark.parametrize("warp_private", [True, False])
+def test_membar_warp_private_loop(warp_private):
+    # Warp w of the store owns elements w * THREADS_PER_WARP + lane (mod 4 *
+    # THREADS_PER_WARP). The second load layout gives each warp a contiguous
+    # quarter, mostly stored by the other warps.
+    ITERS, BLOCK = 64, 16 * THREADS_PER_WARP
+    store_layout = ttgl.BlockedLayout([1], [THREADS_PER_WARP], [4], [0])
+    load_layout = store_layout if warp_private else ttgl.BlockedLayout([4], [THREADS_PER_WARP], [4], [0])
+    out = torch.empty(BLOCK, device="cuda", dtype=torch.int32)
+    compiled = _membar_loop_kernel[(1, )](out, ITERS, BLOCK, store_layout, load_layout, num_warps=4)
+
+    offsets = torch.arange(BLOCK, device="cuda", dtype=torch.int32)
+    torch.testing.assert_close(out, offsets * ITERS * ITERS + ITERS * (ITERS - 1) // 2)
+    if is_hip():
+        has_cta_barrier = "s_barrier" in compiled.asm["amdgcn"]
+    else:
+        has_cta_barrier = re.search(r"\bbar(rier)?\.sync\b", compiled.asm["ptx"]) is not None
+    assert has_cta_barrier != warp_private
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper")
 def test_copy_kernel_multi_cta():
     XBLOCK = 2048

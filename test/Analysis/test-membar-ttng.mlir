@@ -396,7 +396,7 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<256x64xf16, #shared>, %i1 : 
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
   // CHECK: cf.cond_br
   scf.if %i1 {
-    //  CHECK-NOT: ttg.barrier local
+    //  CHECK-NOT: ttg.barrier {{(warp )?}}local
     //      CHECK: ttng.async_tma_copy_global_to_local
     // CHECK-NEXT: ttg.barrier local
     // CHECK-NEXT: ttng.barrier_expect
@@ -406,12 +406,14 @@ tt.func @tma_special_cases_cf(%arg1: !tt.tensordesc<256x64xf16, #shared>, %i1 : 
     ttng.barrier_expect %barrier, 49152, %true : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
     ttng.wait_barrier %barrier, %c0 : !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>
   } else {
-    //  CHECK-NOT: ttg.barrier local
+    //  CHECK-NOT: ttg.barrier {{(warp )?}}local
     //      CHECK: ttg.local_store
     // CHECK-NEXT: cf.br
     ttg.local_store %arg2, %alloc : tensor<256x64xf16, #blocked> -> !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable>
   }
-  //      CHECK: ttg.barrier local
+  // The TMA write completes through the wait; each warp reads the rows it
+  // stored in the else branch.
+  //      CHECK: ttg.barrier warp local
   // CHECK-NEXT: ttg.local_load
   %t = ttg.local_load %alloc : !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory, mutable> -> tensor<256x64xf16, #blocked>
   tt.return %t : tensor<256x64xf16, #blocked>

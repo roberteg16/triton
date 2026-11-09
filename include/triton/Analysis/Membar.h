@@ -320,9 +320,14 @@ struct MembarInfo {
   /// This does not discharge dependencies between different warps.
   bool warpsSynced = false;
 
+  /// Effects since the most recent warp or whole-region synchronization. A
+  /// dependency that stays within each warp only needs to order these.
+  BlockInfo sinceWarpSync;
+
   MembarInfo &join(const MembarInfo &other) {
     pending.join(other.pending);
     entryBlockInfo.join(other.entryBlockInfo);
+    sinceWarpSync.join(other.sinceWarpSync);
     allPathsFromEntrySynced &= other.allPathsFromEntrySynced;
     warpsSynced &= other.warpsSynced;
     return *this;
@@ -332,11 +337,15 @@ struct MembarInfo {
     if (!allPathsFromEntrySynced)
       entryBlockInfo.join(blockInfo);
     pending.join(blockInfo);
+    sinceWarpSync.join(blockInfo);
     if (blockInfo.hasEffects())
       warpsSynced = false;
   }
 
-  void syncWarps() { warpsSynced = true; }
+  void syncWarps() {
+    warpsSynced = true;
+    sinceWarpSync.sync();
+  }
 
   void sync() {
     pending.sync();
@@ -350,6 +359,7 @@ struct MembarInfo {
     if (callee.allPathsFromEntrySynced)
       sync();
     pending.join(callee.pending);
+    sinceWarpSync.join(callee.pending);
     // Keep warp coverage local to the current execution region.
     warpsSynced = false;
   }
@@ -357,6 +367,7 @@ struct MembarInfo {
   template <typename Transform> void transformSlices(Transform transform) {
     pending.transformSlices(transform);
     entryBlockInfo.transformSlices(transform);
+    sinceWarpSync.transformSlices(transform);
   }
 
   bool operator==(const MembarInfo &) const = default;
@@ -435,6 +446,10 @@ private:
   getAllocationSlices(Value value,
                       std::optional<triton::gpu::SharedKind> sharedKind);
   bool isRegionLocal(Value value);
+  /// Whether the accesses of two operations to shared memory are disjoint
+  /// between different warps, so ordering each warp's own accesses suffices.
+  bool isWarpPrivate(Operation *lhs, Operation *rhs);
+  bool computeWarpPrivate(Operation *lhs, Operation *rhs);
   bool mayNotifyPeer(Operation *op);
   BlockInfo getThreadEffects(Operation *op);
   void addThreadDemand(BlockInfo &effects, Operation *op);
@@ -443,6 +458,9 @@ private:
   AccessMode accessMode;
   BufferIndexAnalysis bufferIndexAnalysis;
   DenseMap<Value, bool> regionLocalAllocations;
+  DenseMap<std::pair<Operation *, Operation *>, bool> warpPrivatePairs;
+  /// Warp barriers inserted for warp-private dependencies.
+  llvm::SmallPtrSet<Operation *, 8> warpBarriers;
 };
 
 /// Inserts shared-memory and operation rendezvous barriers across a module,

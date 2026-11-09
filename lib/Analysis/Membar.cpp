@@ -317,6 +317,57 @@ bool MembarAnalysis::isRegionLocal(Value value) {
          });
 }
 
+namespace {
+// The descriptor and register tensor of a local load, store or initialized
+// allocation.
+std::optional<std::pair<Value, RankedTensorType>>
+getRegisterAccess(Operation *op) {
+  if (auto load = dyn_cast<triton::gpu::LocalLoadOp>(op))
+    return std::make_pair(load.getSrc(), load.getType());
+  if (auto store = dyn_cast<triton::gpu::LocalStoreOp>(op))
+    return std::make_pair(store.getDst(), store.getSrc().getType());
+  if (auto alloc = dyn_cast<triton::gpu::LocalAllocOp>(op);
+      alloc && alloc.getSrc())
+    return std::make_pair(alloc.getResult(),
+                          cast<RankedTensorType>(alloc.getSrc().getType()));
+  return std::nullopt;
+}
+} // namespace
+
+bool MembarAnalysis::isWarpPrivate(Operation *lhs, Operation *rhs) {
+  auto [it, inserted] = warpPrivatePairs.try_emplace({lhs, rhs}, false);
+  if (inserted)
+    it->second = computeWarpPrivate(lhs, rhs);
+  return it->second;
+}
+
+bool MembarAnalysis::computeWarpPrivate(Operation *lhs, Operation *rhs) {
+  auto lhsAccess = getRegisterAccess(lhs);
+  auto rhsAccess = getRegisterAccess(rhs);
+  // Warp indices are relative to a warp-specialized partition. Footprints are
+  // only comparable within this function's allocation frame.
+  auto function = cast<FunctionOpInterface>(allocation.getOperation());
+  if (!lhsAccess || !rhsAccess ||
+      lhs->getParentOfType<FunctionOpInterface>() != function ||
+      rhs->getParentOfType<FunctionOpInterface>() != function ||
+      lhs->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
+      rhs->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
+      !regions.getFootprint(lhsAccess->first, function) ||
+      !regions.getFootprint(rhsAccess->first, function))
+    return false;
+  const auto *lhsWarps =
+      regions.getWarpFootprints(lhsAccess->first, lhsAccess->second);
+  const auto *rhsWarps =
+      regions.getWarpFootprints(rhsAccess->first, rhsAccess->second);
+  if (!lhsWarps || !rhsWarps || lhsWarps->size() != rhsWarps->size())
+    return false;
+  for (auto [lhsWarp, lhsAddresses] : llvm::enumerate(*lhsWarps))
+    for (auto [rhsWarp, rhsAddresses] : llvm::enumerate(*rhsWarps))
+      if (lhsWarp != rhsWarp && lhsAddresses.intersects(rhsAddresses))
+        return false;
+  return true;
+}
+
 bool MembarAnalysis::mayNotifyPeer(Operation *op) {
   // Nested operations are checked separately; region scratch is private.
   if (isa<RegionBranchOpInterface, triton::AtomicLoadOp, triton::AtomicPollOp,
@@ -357,6 +408,36 @@ Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
   if (!requiresThreadSync(pending, effects) &&
       !pending.isIntersected(effects, filter, &allocation, sliceFilter))
     return nullptr;
+  // Dependencies that stay within each warp only need each warp's own
+  // accesses ordered, once after the last warp synchronization.
+  auto canSkipWithinWarps = [&](Operation *before, Operation *after,
+                                bool beforeIsRead, bool afterIsRead,
+                                Allocation *allocation,
+                                const AllocationSlice &beforeSlice,
+                                const AllocationSlice &afterSlice) {
+    return (filter && filter(before, after, beforeIsRead, afterIsRead,
+                             allocation, beforeSlice, afterSlice)) ||
+           isWarpPrivate(before, after);
+  };
+  if (!cluster && !requiresThreadSync(pending, effects) &&
+      !pending.isIntersected(effects, canSkipWithinWarps, &allocation,
+                             sliceFilter)) {
+    if (!membarInfo->sinceWarpSync.isIntersected(effects, filter, &allocation,
+                                                 sliceFilter))
+      return nullptr;
+    builder->setInsertionPoint(op);
+    Operation *barrier = triton::gpu::BarrierOp::create(
+        *builder, op->getLoc(), triton::gpu::AddrSpace::Local,
+        triton::gpu::BarrierScope::Warp);
+    warpBarriers.insert(barrier);
+    membarInfo->syncWarps();
+    return barrier;
+  }
+  // A revisit can need a CTA barrier where an earlier visit inserted a warp
+  // barrier. The CTA barrier also orders each warp's accesses.
+  if (Operation *previous = op->getPrevNode();
+      previous && warpBarriers.erase(previous))
+    previous->erase();
   // The barrier clears incoming state. The operation's own effects still
   // follow it, including a scratch write that conflicts with a pending read.
   builder->setInsertionPoint(op);
@@ -456,6 +537,7 @@ void MembarAnalysis::updateSuccessor(Operation *terminator, Block *successor,
   if (bufferIndexAnalysis.isBackedgeSuccessor(terminator, successor)) {
     membarInfo->pending.invalidateIterationInfo();
     membarInfo->entryBlockInfo.invalidateIterationInfo();
+    membarInfo->sinceWarpSync.invalidateIterationInfo();
   }
 }
 
@@ -464,6 +546,7 @@ void MembarAnalysis::updateExitState(MembarInfo *membarInfo) {
   // index identity is no longer meaningful.
   membarInfo->pending.invalidateIterationInfo();
   membarInfo->entryBlockInfo.invalidateIterationInfo();
+  membarInfo->sinceWarpSync.invalidateIterationInfo();
 }
 
 triton::BarrierStages MembarAnalysis::getBarrierStages(Operation *op) {
